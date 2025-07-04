@@ -1,7 +1,8 @@
 import requests
 import pandas as pd
 import json
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 import time
 import gspread
 from google.oauth2.service_account import Credentials
@@ -12,6 +13,10 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
 import logging
+from vnstock import Quote, Trading
+import os
+from dotenv import load_dotenv
+import pytz
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -110,7 +115,6 @@ class VietStockScraper:
                 try:
                     elements = driver.find_elements(By.CSS_SELECTOR, selector)
                     if elements:
-                        logger.info(f"Found {len(elements)} elements with selector: {selector}")
                         for element in elements:
                             if element.text.strip():
                                 data_elements.append({
@@ -177,12 +181,16 @@ class VietStockScraper:
                     for i, cell in enumerate(cells[:len(headers)]):
                         row_data[headers[i] if i < len(headers) else f'Column_{i}'] = cell.get_text(strip=True)
                     # Trích số tiền cổ tức từ cột nội dung (giả sử tên là 'Nội dung')
-                    content = row_data.get('Nội dung') or row_data.get('Event') or row_data.get('Sự kiện') or ''
-                    match = re.search(r'(\\d+)\\s*đồng/CP', content)
+                    content = row_data.get('Nội dung sự kiện') or row_data.get('Event') or row_data.get('Sự kiện') or ''
+                    # match = re.search(r'(\d{1,3}(?:,\\d{3})*)(?=\\s*đồng/CP)', content)
+                    match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*đồng/CP', content)
+
+
                     if match:
-                        row_data['Số tiền (đồng/CP)'] = int(match.group(1))
+                        row_data['dividendValue'] = int(match.group(1).replace(',', ''))
                     else:
-                        row_data['Số tiền (đồng/CP)'] = None
+                        row_data['dividendValue'] = None
+                    
                     data_list.append(row_data)
             return data_list
         except Exception as e:
@@ -235,6 +243,49 @@ class VietStockScraper:
             time.sleep(2)
         
         return all_data
+
+    def get_stock_price(self, stock_code, event_date):
+        """Lấy closePrice của mã cổ phiếu tại ngày event_date (YYYY-MM-DD)"""
+        try:
+            # df = Quote(symbol=stock_code, start_date=event_date, end_date=event_date, resolution='1D', type='stock')
+            quote = Quote(symbol=stock_code, source='VCI')
+            df = quote.history(start=event_date, end=event_date, interval='1D')
+
+            if not df.empty:
+                return df.iloc[0]['close'] or df.iloc[0]['high'] or df.iloc[0]['low']
+            else:
+                return 0
+        except Exception as e:
+            # logger.warning(f"Không lấy được giá cho {stock_code} ngày {event_date}: {e}")
+            logger.warning(f"Không lấy được giá cho {stock_code} ngày {event_date}")
+            return 0
+
+    def add_stock_prices(self, data):
+        """Thêm cột closePrice vào từng dòng dữ liệu, chỉ lấy giá cho các dòng Ngày GDKHQ > hôm nay + 3 ngày"""
+        today = datetime.today() - timedelta(days=1)
+        min_date = today + timedelta(days=2)
+        filtered_data = []
+        for row in data:
+            date_str = row.get('Ngày GDKHQ') or row.get('Ngày GDKHQ▼')
+            try:
+                dt = pd.to_datetime(date_str, dayfirst=True, errors='coerce')
+            except:
+                dt = pd.NaT
+            if pd.notnull(dt) and dt > min_date:
+                stock_code = row.get('Mã CK') or row.get('Mã chứng khoán') or row.get('Stock code')
+                if stock_code:
+                    price = self.get_stock_price(stock_code, today.strftime('%Y-%m-%d'))
+                    row['closePrice'] = price  # Convert to VND
+                    if price and row.get('dividendValue'):
+                        row['closePrice'] = row['closePrice']*1000
+                        row['percent'] = int(round(row['dividendValue']* 100 / row['closePrice'])) 
+                    else:
+                        row['percent'] = 0
+                else:
+                    row['closePrice'] = 0
+                    row['percent'] = 0
+                filtered_data.append(row)
+        return filtered_data
     
     def save_to_google_sheets(self, data, spreadsheet_name="VietStock_Events", worksheet_name="Events"):
         """Save data to Google Sheets"""
@@ -297,8 +348,54 @@ class VietStockScraper:
             logger.error(f"Error saving to CSV: {str(e)}")
             return False
 
+    def send_telegram_message(self, filtered_items, telegram_token, chat_id, template=None):
+        """Gửi danh sách các mã lọc được qua Telegram với template đặc biệt cho sự kiện cổ tức."""
+        if not filtered_items:
+            logger.info("Không có mã nào thỏa điều kiện để gửi Telegram.")
+            return False
+        # Template đặc biệt cho sự kiện cổ tức
+        message_lines = ["Thông báo sự kiện cổ tức:"]
+        for idx, row in enumerate(filtered_items, 1):
+            stock_code = row.get('Mã CK') or row.get('Mã chứng khoán') or row.get('Stock code', '')
+            close_price = row.get('closePrice', 0)
+            percent = row.get('percent', 0)
+            ngay_gdkhq = row.get('Ngày GDKHQ') or row.get('Ngày GDKHQ▼', '')
+            try:
+                close_price_val = float(close_price)
+                percent_val = float(percent)
+                so_tien = int(round(close_price_val * percent_val / 100))
+            except:
+                so_tien = 0
+            message_lines.append(f"{idx}. [{row.get('Sàn')}][{stock_code}] - {close_price}")
+            message_lines.append(f"    + GDKHQ: {ngay_gdkhq} - {percent}%")
+            message_lines.append(f"    + Số tiền nhận được: {so_tien}/CP VND")
+        full_message = '\n'.join(message_lines)
+        url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': full_message
+        }
+        try:
+            response = requests.post(url, data=payload)
+            if response.status_code == 200:
+                logger.info("Đã gửi tin nhắn Telegram thành công.")
+                return True
+            else:
+                logger.error(f"Gửi Telegram thất bại: {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Lỗi khi gửi Telegram: {e}")
+            return False
+
 def main():
     """Main execution function"""
+    # Load environment variables
+    load_dotenv()
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    FILTER_PRICE = int(os.getenv("FILTER_PRICE", 30000))  # Default to 30000 if not set
+    FILTER_PERCENT = int(os.getenv("FILTER_PERCENT", 7))  # Default to 7 if not set
+    FILTER_MIN_DATE = int(os.getenv("FILTER_MIN_DATE", 2))  # Default to 2 if not set
     # Configuration
     GOOGLE_CREDENTIALS_PATH = "account-credentials.json"  # Update this path
     
@@ -316,35 +413,44 @@ def main():
         group=13,
         max_pages=1  # Adjust as needed
     )
-    # data = scraper.scrape_vietstock_events(
-    #     from_date="2020-04-12",
-    #     to_date="2025-06-12",
-    #     exchange=5,
-    #     group=13,
-    #     max_pages=1  # Adjust as needed
-    # )
     
     if data:
         logger.info(f"Successfully scraped {len(data)} records")
-        
+        data = scraper.add_stock_prices(data)
+           
         # Save to Google Sheets
-        if scraper.gc:
-            success = scraper.save_to_google_sheets(data, "VietStock_Events_2025")
-            if not success:
-                logger.warning("Failed to save to Google Sheets, saving to CSV instead")
-                scraper.save_to_csv(data, "vietstock_events_backup.csv")
-        else:
-            # Save to CSV if Google Sheets not available
-            scraper.save_to_csv(data, "vietstock_events.csv")
-        
-        # Display sample data
+        now_str = datetime.now().strftime("%Y%m%d_%H%M")
+        backup_filename = f"vietstock_events_{now_str}.csv"
+        # Lọc dữ liệu theo điều kiện closePrice < 30000 và percent > 7 và Ngày GDKHQ > hôm nay + 3 ngày
         if data:
             df = pd.DataFrame(data)
-            print("\nSample data:")
-            print(df.head())
-            print(f"\nTotal columns: {len(df.columns)}")
-            print(f"Columns: {list(df.columns)}")
-            
+            today = datetime.today()
+            def parse_date(date_str):
+                try:
+                    return pd.to_datetime(date_str, dayfirst=True, errors='coerce')
+                except:
+                    return pd.NaT
+            df['Ngày GDKHQ_dt'] = df['Ngày GDKHQ▼'].apply(parse_date)
+            min_date = today + timedelta(days=FILTER_MIN_DATE)
+            filtered_df = df[(df['closePrice'] < FILTER_PRICE) & (df['percent'] >= FILTER_PERCENT) & (df['Ngày GDKHQ_dt'] >= min_date)]
+            filtered_df = filtered_df.drop(columns=['Ngày GDKHQ_dt'])
+            filtered_filename = f"vietstock_events_filtered_{now_str}.csv"
+            filtered_df.to_csv(filtered_filename, index=False, encoding='utf-8-sig')
+            # Gửi Telegram nếu có dữ liệu lọc
+            filtered_items = filtered_df.to_dict(orient='records')
+            scraper.send_telegram_message(filtered_items, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        scraper.save_to_csv(data, backup_filename)
+
+        # if scraper.gc:
+        #     success = scraper.save_to_google_sheets(data, "VietStock_Events_2025")
+        #     if not success:
+        #         logger.warning("Failed to save to Google Sheets, saving to CSV instead")
+        #         scraper.save_to_csv(data, "vietstock_events_backup.csv")
+        # else:
+        #     # Save to CSV if Google Sheets not available
+        #     scraper.save_to_csv(data, "vietstock_events.csv")
+        
+                
     else:
         logger.error("No data was scraped")
 

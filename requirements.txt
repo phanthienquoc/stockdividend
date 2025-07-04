@@ -1,3 +1,4 @@
+pytz
 requests
 beautifulsoup4
 pandas
@@ -6,3 +7,5 @@ oauth2client
 openpyxl
 gspread
 vnstock
+selenium
+dotenv

@@ -1,2 +1,15 @@
 .venv
-account_credentials.json
+.env
+account-credentials.json
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.pyd           
+vietstock_events*.csv
+.DS_Store
+*.log
+*.sqlite3
+*.db
+*.sqlite                    
+rsa
